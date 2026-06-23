@@ -342,6 +342,17 @@ int Socket::Recv( void* _buf, int len, int timeout )
     const auto sock = m_sock.load( std::memory_order_relaxed );
     auto buf = (char*)_buf;
 
+#ifdef __EMSCRIPTEN__
+    // poll() is not proxied by -sPROXY_POSIX_SOCKETS. Use a blocking recv() — the
+    // proxy services blocking recv on a worker thread; the timeout is dropped.
+    // Reads are gated by HasData() (which routes through godot_tracy_poll_readable),
+    // so recv() is only entered once the proxy has signalled data is available:
+    // the handshake reads, and HandleServerQuery() in the streaming loop. A peer
+    // that stalls mid-message after signalling readiness can block this recv()
+    // until it sends or the connection drops — acceptable for the trusted
+    // tracy-capture peer this build targets.
+    return recv( sock, buf, len, 0 );
+#else
     struct pollfd fd;
     fd.fd = (socket_t)sock;
     fd.events = POLLIN;
@@ -354,6 +365,7 @@ int Socket::Recv( void* _buf, int len, int timeout )
     {
         return -1;
     }
+#endif
 }
 
 int Socket::ReadUpTo( void* _buf, int len )
@@ -420,16 +432,28 @@ bool Socket::ReadRaw( void* _buf, int len, int timeout )
     return true;
 }
 
+#ifdef __EMSCRIPTEN__
+// poll() is not proxied by -sPROXY_POSIX_SOCKETS. This dedicated readability
+// check is routed through the proxy (defined in emscripten's
+// websocket_to_posix_socket.c, patched alongside this build) so the server's
+// source-location queries are serviced — without it every zone name is "???".
+extern "C" int godot_tracy_poll_readable( int sock );
+#endif
+
 bool Socket::HasData()
 {
     const auto sock = m_sock.load( std::memory_order_relaxed );
     if( m_bufLeft > 0 ) return true;
 
+#ifdef __EMSCRIPTEN__
+    return godot_tracy_poll_readable( (int)sock ) > 0;
+#else
     struct pollfd fd;
     fd.fd = (socket_t)sock;
     fd.events = POLLIN;
 
     return poll( &fd, 1, 0 ) > 0;
+#endif
 }
 
 bool Socket::IsValid() const
@@ -515,6 +539,18 @@ Socket* ListenSocket::Accept()
     struct sockaddr_storage remote;
     socklen_t sz = sizeof( remote );
 
+#ifdef __EMSCRIPTEN__
+    // poll() is not proxied by -sPROXY_POSIX_SOCKETS, so the poll-then-accept
+    // gate never fires on a proxied socket. Block directly in accept() — the
+    // emscripten socket proxy services it on a worker thread and returns when a
+    // client connects. The Tracy worker only reaches Accept between sessions, so
+    // blocking here is correct.
+    int sock = accept( m_sock, (sockaddr*)&remote, &sz );
+    if( sock == -1 ) return nullptr;
+    auto ptr = (Socket*)tracy_malloc( sizeof( Socket ) );
+    new(ptr) Socket( sock );
+    return ptr;
+#else
     struct pollfd fd;
     fd.fd = (socket_t)m_sock;
     fd.events = POLLIN;
@@ -537,6 +573,7 @@ Socket* ListenSocket::Accept()
     {
         return nullptr;
     }
+#endif
 }
 
 void ListenSocket::Close()
